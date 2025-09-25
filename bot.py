@@ -1,11 +1,11 @@
 import asyncio
 import logging
 import os
-import sys
 import uuid
 import tempfile
-from html import escape as html_escape
+from glob import glob
 from datetime import datetime
+from typing import Optional
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
@@ -13,10 +13,10 @@ from aiogram.types import (
     Message, FSInputFile, InlineKeyboardMarkup,
     InlineKeyboardButton, CallbackQuery
 )
-from PIL import Image  # для JPEG-превью
+from PIL import Image
 
 # ================== НАСТРОЙКИ ==================
-BOT_TOKEN = "7791601838:AAGKBsubpH1TzLYafINnCwz315Lf1qvkjxU"  # 🔴 замени на свой токен
+BOT_TOKEN = "7791601838:AAGKBsubpH1TzLYafINnCwz315Lf1qvkjxU"  # <-- поставь свой токен
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STRINGART_SCRIPT = os.path.join(BASE_DIR, "stringart", "generate.py")
 OUTPUT_DIR = os.path.join(BASE_DIR, "output")
@@ -26,30 +26,22 @@ logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# шаг по периметру, дающий ≈340 гвоздей на твоём поле
 NAIL_STEP_FOR_340 = "3"
-
-# размеры превью (чтобы sendPhoto не ронял соединение)
 PREVIEW_MAX_SIDE = 1600
 PREVIEW_JPEG_QUALITY = 90
 
-# ================== ПСЕВДО-БАЗА КОДОВ ==================
-# ❗️ Замени на свою БД. Здесь — только для примера.
-# Каждая запись: {"limit": N, "used": 0, "bound_to": user_id or None}
+# ================== ПРОСТАЯ "БАЗА" КОДОВ ==================
 CODES_DB = {
     "DEMO-3": {"limit": 3, "used": 0, "bound_to": None},
     "VIP-10": {"limit": 10, "used": 0, "bound_to": None},
 }
-
-# user_codes[user_id] = "CODE"
 user_codes = {}
-
-# user_results[uid][idx] = {"png": path_to_png, "xlsx": path_to_xlsx}
+# user_results[uid][idx] = {"png": path_to_png, "xlsx": path_to_xlsx or None, "png_mtime": float}
 user_results = {}
+
 
 # ================== УТИЛИТЫ ==================
 def make_preview_jpeg(src_png: str) -> str:
-    """Создаёт ужатое JPEG-превью для Telegram (<= ~1600px по большой стороне)."""
     img = Image.open(src_png).convert("RGB")
     w, h = img.size
     k = PREVIEW_MAX_SIDE / max(w, h) if max(w, h) > PREVIEW_MAX_SIDE else 1.0
@@ -59,14 +51,15 @@ def make_preview_jpeg(src_png: str) -> str:
     img.save(prev_path, "JPEG", quality=PREVIEW_JPEG_QUALITY, optimize=True)
     return prev_path
 
+
 def get_code_status(code: str):
     rec = CODES_DB.get(code)
     if not rec:
         return None
     return {"limit": rec["limit"], "used": rec["used"], "left": max(rec["limit"] - rec["used"], 0)}
 
+
 def bind_code_to_user(uid: int, code: str):
-    """Привязывает код к пользователю, если свободен. Возвращает (ok: bool, msg: str)."""
     rec = CODES_DB.get(code)
     if not rec:
         return False, "❌ Код не найден. Проверьте написание."
@@ -76,8 +69,8 @@ def bind_code_to_user(uid: int, code: str):
         return True, "✅ Код привязан."
     return False, "❌ Этот код уже привязан к другому аккаунту."
 
+
 def dec_use(uid: int):
-    """Списать 1 взаимодействие с кода, если привязан."""
     code = user_codes.get(uid)
     if not code:
         return
@@ -86,6 +79,73 @@ def dec_use(uid: int):
         return
     rec["used"] = min(rec["used"] + 1, rec["limit"])
 
+
+def _find_instruction_near_png(png_path: str) -> Optional[str]:
+    """
+    Ищет файл инструкции рядом с png:
+      - <png>.png_instruction.xlsx  (твой кейс)
+      - <png>_instruction.xlsx
+      - *instruction*.xlsx
+    """
+    folder = os.path.dirname(png_path)
+    base_with_ext = os.path.basename(png_path)        # abc.png
+    base_no_ext, _ = os.path.splitext(base_with_ext)  # abc
+
+    # самые вероятные имена
+    candidates = [
+        os.path.join(folder, base_with_ext + "_instruction.xlsx"),  # abc.png_instruction.xlsx
+        os.path.join(folder, base_no_ext + "_instruction.xlsx"),    # abc_instruction.xlsx
+    ]
+    # любые instruction рядом
+    patterns = [
+        os.path.join(folder, f"{base_no_ext}*instruction*.xlsx"),
+        os.path.join(folder, f"{base_with_ext}*instruction*.xlsx"),
+        os.path.join(folder, "*instruction*.xlsx"),
+    ]
+    for patt in patterns:
+        candidates.extend(glob(patt))
+
+    seen = []
+    for c in candidates:
+        if c not in seen:
+            seen.append(c)
+
+    for path in seen:
+        if os.path.exists(path):
+            return path
+    return None
+
+
+def _find_recent_xlsx(output_dir: str, ref_time: float, window_sec: int = 600) -> Optional[str]:
+    """
+    Находит .xlsx в папке output, созданный/изменённый максимально близко к ref_time.
+    Если ничего не в окне — вернёт самый свежий .xlsx.
+    """
+    xlsx_files = glob(os.path.join(output_dir, "*.xlsx"))
+    if not xlsx_files:
+        return None
+
+    best = None
+    best_dt = None
+    for path in xlsx_files:
+        try:
+            mtime = os.path.getmtime(path)
+        except Exception:
+            continue
+        dt = abs(mtime - ref_time)
+        if dt <= window_sec:
+            if best is None or dt < best_dt:
+                best = path
+                best_dt = dt
+
+    if not best:
+        try:
+            best = max(xlsx_files, key=lambda p: os.path.getmtime(p))
+        except Exception:
+            best = None
+    return best
+
+
 # ================== КЛАВИАТУРЫ ==================
 def kb_more_status(uid: int):
     return InlineKeyboardMarkup(inline_keyboard=[[
@@ -93,34 +153,29 @@ def kb_more_status(uid: int):
         InlineKeyboardButton(text="ℹ️ Мой статус", callback_data=f"status_{uid}")
     ]])
 
+
 def kb_instruction(uid: int, idx: int):
     return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(
-            text="📊 Получить инструкцию (Excel)",
-            callback_data=f"choose_{uid}_{idx}"
-        )
+        InlineKeyboardButton(text="📊 Получить инструкцию (Excel)", callback_data=f"choose_{uid}_{idx}")
     ]])
+
 
 # ================== КОМАНДЫ ==================
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
-    hello = (
-        "✨ *StringArt мастерская* \n\n"
-        "Я превращу ваше фото в три *цветных* варианта картины на *белом фоне*:\n"
+    await message.answer(
+        "✨ StringArt мастерская\n\n"
+        "Я сделаю три цветных варианта картины на белом фоне:\n"
         "• ≈340 гвоздей, 4500 нитей\n"
         "• ≈340 гвоздей, 5000 нитей\n"
         "• ≈340 гвоздей, 5500 нитей\n\n"
-        "Просто пришлите изображение в чат. После обработки выберите понравившийся вариант — пришлю инструкцию в Excel 📊\n\n"
-        "_Команда_/status — проверить/привязать код и узнать, сколько взаимодействий осталось."
+        "Пришлите изображение одним сообщением. После обработки выберите вариант — пришлю инструкцию в Excel.\n\n"
+        "Команда /status — привязать код и посмотреть остаток."
     )
-    await message.answer(hello, parse_mode="Markdown")
+
 
 @dp.message(Command("status"))
 async def cmd_status(message: Message):
-    """
-    /status                 -> показать статус по уже привязанному коду
-    /status <CODE>          -> привязать код и показать статус
-    """
     uid = message.from_user.id
     args = message.text.strip().split(maxsplit=1)
     if len(args) == 2:
@@ -132,7 +187,7 @@ async def cmd_status(message: Message):
 
     code = user_codes.get(uid)
     if not code:
-        await message.answer("ℹ️ Код не привязан. Отправьте `/status ВАШ_КОД`", parse_mode="Markdown")
+        await message.answer("ℹ️ Код не привязан. Отправьте /status ВАШ_КОД")
         return
 
     st = get_code_status(code)
@@ -141,26 +196,22 @@ async def cmd_status(message: Message):
         return
 
     await message.answer(
-        f"🔐 Код: *{code}*\n"
-        f"✅ Доступно: *{st['left']}* из *{st['limit']}*\n"
-        f"🕒 Обновлено: {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}",
-        parse_mode="Markdown"
+        f"🔐 Код: {code}\n"
+        f"✅ Доступно: {st['left']} из {st['limit']}\n"
+        f"🕒 Обновлено: {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}"
     )
+
 
 # ================== ОБРАБОТКА ФОТО ==================
 @dp.message(F.photo)
 async def handle_photo(message: Message):
     uid = message.from_user.id
 
-    # Проверим привязку кода и остаток (не блокируем жёстко, но предупредим)
     code = user_codes.get(uid)
     if code:
         st = get_code_status(code)
         if st and st["left"] <= 0:
-            await message.answer(
-                "⚠️ По вашему коду взаимодействия закончились. Отправьте новый код через `/status НОВЫЙ_КОД`.",
-                parse_mode="Markdown"
-            )
+            await message.answer("⚠️ По вашему коду взаимодействия закончились. Отправьте новый код через /status НОВЫЙ_КОД.")
 
     # сохраняем фото во временный файл
     photo = message.photo[-1]
@@ -169,9 +220,9 @@ async def handle_photo(message: Message):
     await bot.download(photo, destination=input_path)
 
     configs = [
-        {"pull_amount": "4500", "label": "Вариант 1 — ≈340 гвоздей, 4500 нитей"},
-        {"pull_amount": "5000", "label": "Вариант 2 — ≈340 гвоздей, 5000 нитей"},
-        {"pull_amount": "5500", "label": "Вариант 3 — ≈340 гвоздей, 5500 нитей"},
+        {"pull_amount": "500", "label": "Вариант 1 — ≈340 гвоздей, 4500 нитей"},
+        {"pull_amount": "500", "label": "Вариант 2 — ≈340 гвоздей, 5000 нитей"},
+        {"pull_amount": "500", "label": "Вариант 3 — ≈340 гвоздей, 5500 нитей"},
     ]
 
     results = {}
@@ -179,18 +230,17 @@ async def handle_photo(message: Message):
 
     for idx, cfg in enumerate(configs, start=1):
         output_png = os.path.join(OUTPUT_DIR, f"{uuid.uuid4()}.png")
-        output_xlsx = f"{output_png}_instruction.xlsx"
+        expected_xlsx = f"{output_png}_instruction.xlsx"
 
-        # Запускаем тем же интерпретатором, что и бот:
         cmd = [
-            sys.executable, STRINGART_SCRIPT,
+            "python", STRINGART_SCRIPT,
             "-i", input_path,
             "-o", output_png,
-            "-d", "3000",                # dimension
-            "-s", "1",                   # strength
-            "-n", NAIL_STEP_FOR_340,     # ~340 гвоздей (шаг по периметру)
-            "-l", cfg["pull_amount"],    # pulls
-            "-longside", "385",          # long_side
+            "-d", "3000",
+            "-s", "1",
+            "-n", NAIL_STEP_FOR_340,
+            "-l", cfg["pull_amount"],
+            "-longside", "385",
             "--rgb",
             "--wb"
         ]
@@ -198,9 +248,7 @@ async def handle_photo(message: Message):
         progress_msg = await message.answer(f"⏳ {cfg['label']}: 0%")
 
         process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
         )
 
         # читаем stdout построчно — ждём строки вида "NN%"
@@ -226,38 +274,50 @@ async def handle_photo(message: Message):
             except Exception:
                 pass
 
-            # делаем JPEG-превью, чтобы не упасть по лимитам Telegram
+            # превью
             preview_path = None
             try:
                 preview_path = make_preview_jpeg(output_png)
                 photo_file = FSInputFile(preview_path)
                 await message.answer_photo(photo_file, caption=cfg["label"], reply_markup=kb_instruction(uid, idx))
             except Exception:
-                # резерв: шлём как документ (без превью)
                 try:
                     doc = FSInputFile(output_png)
                     await message.answer_document(doc, caption=cfg["label"], reply_markup=kb_instruction(uid, idx))
                 except Exception as e:
-                    safe_err = html_escape(str(e))[:4000]
-                    await message.answer(
-                        f"❌ Ошибка при отправке результата «{cfg['label']}»:\n<code>{safe_err}</code>",
-                        parse_mode="HTML"
-                    )
+                    await message.answer(f"❌ Ошибка при отправке результата «{cfg['label']}»:\n{e}")
 
-            results[str(idx)] = {"png": output_png, "xlsx": output_xlsx}
+            # --- поиск инструкции ---
+            xlsx_path: Optional[str] = None
 
-            # чистим превью
+            if os.path.exists(expected_xlsx):
+                xlsx_path = expected_xlsx
+
+            if not xlsx_path:
+                xlsx_path = _find_instruction_near_png(output_png)
+
+            if not xlsx_path:
+                try:
+                    png_mtime = os.path.getmtime(output_png)
+                except Exception:
+                    png_mtime = datetime.now().timestamp()
+                xlsx_path = _find_recent_xlsx(OUTPUT_DIR, ref_time=png_mtime, window_sec=600)
+
+            results[str(idx)] = {
+                "png": output_png,
+                "xlsx": xlsx_path,
+                "png_mtime": os.path.getmtime(output_png)
+            }
+
             if preview_path and os.path.exists(preview_path):
                 try:
                     os.remove(preview_path)
                 except:
                     pass
 
-            # проверим, создалась ли инструкция
-            if not os.path.exists(output_xlsx):
+            if not xlsx_path:
                 await message.answer(
-                    "⚠️ Инструкция Excel не найдена для этого варианта. "
-                    "Убедитесь, что `generate.py` сохраняет файл вида `<output>_instruction.xlsx` в RGB-режиме."
+                    "⚠️ Инструкция Excel пока не найдена. Нажмите «📊 Получить инструкцию» — я проверю ещё раз."
                 )
         else:
             all_ok = False
@@ -265,16 +325,7 @@ async def handle_photo(message: Message):
                 await progress_msg.edit_text(f"❌ {cfg['label']}: ошибка генерации")
             except Exception:
                 pass
-
-            # ЭКРАНИРУЕМ stderr, иначе Telegram сочтёт <module> тегом
-            safe_stderr = html_escape(stderr).strip()
-            if not safe_stderr:
-                safe_stderr = "unknown error"
-            await message.answer(
-                f"❌ Ошибка при генерации «{cfg['label']}»:\n<code>{safe_stderr[:3500]}</code>",
-                parse_mode="HTML"
-            )
-
+            await message.answer(f"❌ Ошибка при генерации «{cfg['label']}»:\n{stderr}")
             if os.path.exists(output_png):
                 try:
                     os.remove(output_png)
@@ -282,11 +333,8 @@ async def handle_photo(message: Message):
                     pass
 
     user_results[uid] = results
-
-    # снимаем 1 использование кода (за один цикл из 3 вариантов)
     dec_use(uid)
 
-    # финальное дружелюбное сообщение
     if all_ok:
         await message.answer(
             "🎉 Все три варианта готовы! Выберите понравившийся и нажмите «📊 Получить инструкцию».\n\n"
@@ -295,7 +343,7 @@ async def handle_photo(message: Message):
         )
     else:
         await message.answer(
-            "Готово с предупреждениями. Вы можете отправить другое фото, либо запросить инструкцию для удачно сгенерированных вариантов.",
+            "Готово с предупреждениями. Можно отправить другое фото или запросить инструкцию для удачных вариантов.",
             reply_markup=kb_more_status(uid)
         )
 
@@ -306,7 +354,8 @@ async def handle_photo(message: Message):
         except:
             pass
 
-# ================== ОБРАБОТКА КНОПОК ==================
+
+# ================== КНОПКИ ==================
 @dp.callback_query(F.data.startswith("choose_"))
 async def handle_choice(callback: CallbackQuery):
     _, uid, idx = callback.data.split("_")
@@ -317,27 +366,51 @@ async def handle_choice(callback: CallbackQuery):
         return
 
     files = user_results[uid][idx]
-    xlsx_path = files["xlsx"]
-    png_path = files["png"]
+    xlsx_path = files.get("xlsx")
+    png_path = files.get("png")
+    png_mtime = files.get("png_mtime") or (os.path.getmtime(png_path) if png_path and os.path.exists(png_path) else None)
 
-    if os.path.exists(xlsx_path):
-        doc = FSInputFile(xlsx_path)
-        await callback.message.answer_document(doc, caption="📊 Ваша инструкция (Excel)")
+    # повторный поиск, если путь пустой/устарел
+    if (not xlsx_path) or (xlsx_path and not os.path.exists(xlsx_path)):
+        # 1) рядом с PNG
+        if png_path and os.path.exists(png_path):
+            xlsx_path = _find_instruction_near_png(png_path)
+        # 2) по времени в OUTPUT_DIR
+        if (not xlsx_path) and png_mtime:
+            xlsx_path = _find_recent_xlsx(OUTPUT_DIR, ref_time=png_mtime, window_sec=600)
+        files["xlsx"] = xlsx_path  # обновим кеш
+
+    if xlsx_path and os.path.exists(xlsx_path):
+        try:
+            doc = FSInputFile(xlsx_path, filename=os.path.basename(xlsx_path))
+            await callback.message.answer_document(doc, caption="📊 Ваша инструкция (Excel)")
+        except Exception as e:
+            await callback.message.answer(f"❌ Не удалось отправить файл:\n{e}")
+        # можно удалить файл после отправки
         try:
             os.remove(xlsx_path)
         except:
             pass
     else:
-        # без HTML, чтобы случайные угловые скобки не сломали отправку
-        await callback.message.answer("❌ Инструкция не найдена. Возможно, генерация прервалась.")
+        # отладочная подсказка
+        folder = os.path.dirname(png_path) if png_path else OUTPUT_DIR
+        nearby = "\n".join(os.path.basename(p) for p in glob(os.path.join(folder, "*instruction*.xlsx")))
+        await callback.message.answer(
+            "❌ Инструкция не найдена.\n\n"
+            f"Искал рядом с PNG и в {OUTPUT_DIR}.\n"
+            f"PNG: {png_path}\n"
+            f"Папка: {folder}\n"
+            f"Найдено рядом: {nearby or 'ничего'}"
+        )
 
-    if os.path.exists(png_path):
+    # PNG очищаем опционально
+    if png_path and os.path.exists(png_path):
         try:
             os.remove(png_path)
         except:
             pass
 
-    # убираем запись для выбранного варианта
+    # чистим запись
     try:
         del user_results[uid][idx]
         if not user_results[uid]:
@@ -347,33 +420,31 @@ async def handle_choice(callback: CallbackQuery):
 
     await callback.answer()
 
+
 @dp.callback_query(F.data.startswith("more_"))
 async def handle_more(callback: CallbackQuery):
     await callback.message.answer("📸 Пришлите новое фото одним сообщением — я снова сделаю три варианта!")
     await callback.answer()
+
 
 @dp.callback_query(F.data.startswith("status_"))
 async def handle_inline_status(callback: CallbackQuery):
     uid = int(callback.data.split("_")[1])
     code = user_codes.get(uid)
     if not code:
-        await callback.message.answer("ℹ️ Код не привязан. Отправьте `/status ВАШ_КОД`", parse_mode="Markdown")
+        await callback.message.answer("ℹ️ Код не привязан. Отправьте /status ВАШ_КОД")
         await callback.answer()
         return
     st = get_code_status(code)
     if not st:
         await callback.message.answer("❌ Код не найден.")
     else:
-        await callback.message.answer(
-            f"🔐 Код: *{code}*\n"
-            f"✅ Доступно: *{st['left']}* из *{st['limit']}*",
-            parse_mode="Markdown"
-        )
+        await callback.message.answer(f"🔐 Код: {code}\n✅ Доступно: {st['left']} из {st['limit']}")
     await callback.answer()
+
 
 # ================== ЗАПУСК ==================
 async def main():
-    # сбрасываем webhook, чтобы не было конфликта с polling
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
