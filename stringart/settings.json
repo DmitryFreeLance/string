@@ -1,0 +1,8 @@
+{
+    "dimension": 3000,
+    "pulls": 6000,
+    "strength": 1,
+    "rect": false,
+    "long_side": 385,
+    "input_image_path": "parrot.jpg"
+}
