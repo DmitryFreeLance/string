@@ -1,0 +1,12 @@
+version: "3.9"
+services:
+  stringart:
+    build: .
+    container_name: stringart-bot
+    environment:
+      - BOT_TOKEN=${BOT_TOKEN}       # токен берём из .env
+      - TZ=Europe/Moscow            # при желании поменяй на свой
+    volumes:
+      - ./output:/app/output        # чтобы результаты сохранялись на хосте
+      - ./codes.json:/app/codes.json  # персистентная "БД" кодов
+    restart: unless-stopped

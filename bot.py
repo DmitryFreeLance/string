@@ -17,7 +17,7 @@ from aiogram.types import (
 from PIL import Image
 
 # ==== Настройки ====
-BOT_TOKEN = "7791601838:AAGKBsubpH1TzLYafINnCwz315Lf1qvkjxU"  # <--- замени
+BOT_TOKEN = os.environ["BOT_TOKEN"]
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STRINGART_SCRIPT = os.path.join(BASE_DIR, "stringart", "generate.py")
 OUTPUT_DIR = os.path.join(BASE_DIR, "output")
