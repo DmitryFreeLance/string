@@ -1,9 +1,10 @@
+import os
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 import matplotlib.image as mpimg
 import matplotlib.pyplot as plt
 from skimage.draw import line_aa, ellipse_perimeter
-from math import *
+from math import atan2
 from skimage.transform import resize
 from time import time
 import argparse
@@ -11,7 +12,7 @@ from collections import Counter
 import pandas as pd
 
 
-# from convert_image import convert
+# =============================== УТИЛИТЫ ===============================
 
 def rgb2gray(rgb):
     return np.dot(rgb[..., :3], [0.2989, 0.5870, 0.1140])
@@ -57,11 +58,8 @@ def create_circle_nail_positions(shape, nail_step=3, r1_multip=1, r2_multip=1):
 
 
 def init_canvas(shape, black=False):
-    # ВАЖНО: white background => black=False
-    if black:
-        return np.zeros(shape)
-    else:
-        return np.ones(shape)
+    # white background => black=False; black background => black=True
+    return np.zeros(shape) if black else np.ones(shape)
 
 
 def get_aa_line(from_pos, to_pos, str_strength, picture):
@@ -71,13 +69,13 @@ def get_aa_line(from_pos, to_pos, str_strength, picture):
     return line, rr, cc
 
 
-def find_best_nail_position(current_position, nails, str_pic, orig_pic, str_strength):
-    best_cumulative_improvement = -99999
+def find_best_nail_position(current_position, nails, str_pic, orig_pic, str_strength, random_nails=None):
+    best_cumulative_improvement = -1e18
     best_nail_position = None
     best_nail_idx = None
 
-    if args.random_nails != None:
-        nail_ids = np.random.choice(range(len(nails)), size=args.random_nails, replace=False)
+    if random_nails is not None:
+        nail_ids = np.random.choice(range(len(nails)), size=min(random_nails, len(nails)), replace=False)
         nails_and_ids = list(zip(nail_ids, nails[nail_ids]))
     else:
         nails_and_ids = enumerate(nails)
@@ -99,7 +97,7 @@ def find_best_nail_position(current_position, nails, str_pic, orig_pic, str_stre
 
 
 def create_art(nails, orig_pic, str_pic, str_strength, i_limit=None,
-               progress_offset=0, progress_total=None):
+               progress_offset=0, progress_total=None, random_nails=None):
     start = time()
     iter_times = []
 
@@ -114,28 +112,34 @@ def create_art(nails, orig_pic, str_pic, str_strength, i_limit=None,
         start_iter = time()
         i += 1
 
-        if i % 500 == 0:
-            print(f"Iteration {i}")
-
-        if i_limit == None:
-            if fails >= 3:
-                break
+        if i_limit is None:
+            if i % 500 == 0:
+                print(f"Iteration {i}", flush=True)
         else:
             if i > i_limit:
                 break
-            # прогресс для бота (если progress_total задан — сквозной по каналам)
-            percent = int(((progress_offset + i) / progress_total) * 100) if progress_total else int(i / i_limit * 100)
+            if progress_total:
+                percent = int(((progress_offset + i) / progress_total) * 100)
+            else:
+                percent = int(i / i_limit * 100)
             if percent > last_percent:
                 last_percent = percent
                 print(f"{percent}%", flush=True)
 
         idx, best_nail_position, best_cumulative_improvement = find_best_nail_position(
-            current_position, nails, str_pic, orig_pic, str_strength
+            current_position, nails, str_pic, orig_pic, str_strength, random_nails=random_nails
         )
 
-        if best_cumulative_improvement <= 0:
-            fails += 1
-            continue
+        if i_limit is None:
+            # старый «несчётный» режим — додавливаем 3 провала подряд
+            if best_cumulative_improvement <= 0:
+                fails += 1
+                if fails >= 3:
+                    break
+                continue
+        else:
+            # при фиксированном лимите — шаг делаем всегда, даже если прироста нет
+            pass
 
         pull_order.append(idx)
         best_overlayed_line, rr, cc = get_aa_line(current_position, best_nail_position, str_strength, str_pic)
@@ -144,8 +148,12 @@ def create_art(nails, orig_pic, str_pic, str_strength, i_limit=None,
         current_position = best_nail_position
         iter_times.append(time() - start_iter)
 
-    print(f"Time: {time() - start}")
-    print(f"Avg iteration time: {np.mean(iter_times)}")
+        if i_limit is None and i > 20000:
+            break
+
+    print(f"Time: {time() - start}", flush=True)
+    if iter_times:
+        print(f"Avg iteration time: {np.mean(iter_times)}", flush=True)
     return pull_order
 
 
@@ -161,12 +169,21 @@ def pull_order_to_array_bw(order, canvas, nails, strength):
     return np.clip(canvas, a_min=0, a_max=1)
 
 
-def npToRGB(np_array):
-    return [round(np_array[0] * 255), round(np_array[1] * 255), round(np_array[2] * 255)]
+def _snap_255(x):
+    """Квантование в {0,255} по порогу 127.5"""
+    return 255 if x >= 127.5 else 0
 
 
-def gradToABCD(number):
-    nails_count = len(nails)
+def npToRGB255(np_array):
+    """Перевод [0..1] -> {0,255} с квантованием по каждому каналу"""
+    r = _snap_255(round(np_array[0] * 255))
+    g = _snap_255(round(np_array[1] * 255))
+    b = _snap_255(round(np_array[2] * 255))
+    return [r, g, b]
+
+
+def gradToABCD(number, nails_global):
+    nails_count = len(nails_global)
     new_number = number % (nails_count // 4)
     if number < (nails_count // 4) + 1:
         return f'A{new_number + 1}'
@@ -178,8 +195,8 @@ def gradToABCD(number):
         return f'D{new_number + 1}'
 
 
-def rectToABCD(number):
-    nails_count = len(nails)
+def rectToABCD(number, nails_global):
+    nails_count = len(nails_global)
     new_number = number % (nails_count // 4)
     if number < (nails_count // 4) + 1:
         return f'A{new_number + 1}'
@@ -192,41 +209,45 @@ def rectToABCD(number):
 
 
 def pull_order_to_array_rgb(orders, canvas, nails, colors, strength, isRect):
+    """
+    Рисуем по кругу: R -> G -> B -> ...
+    Цвет одной нити в Excel — это МАЖОРИТАРНЫЙ цвет пикселей линии ПОСЛЕ отрисовки,
+    но квантованный в {0,255} по каждому каналу, чтобы в таблице были только допустимые цифры.
+    """
     color_order_iterators = [iter(zip(order, order[1:])) for order in orders]
     color_order = []
-    pull_number = 0
 
     for _ in range(len(orders[0]) - 1):
-        # pull colors alternately
         for color_idx, iterator in enumerate(color_order_iterators):
             pull_start, pull_end = next(iterator)
-            rr_aa, cc_aa, val_aa = line_aa(
+            rr_aa, cc_aa, _ = line_aa(
                 nails[pull_start][0], nails[pull_start][1],
                 nails[pull_end][0], nails[pull_end][1]
             )
-            pull_number += 1
 
             # рисуем линию цветом канала
             canvas[rr_aa, cc_aa] += colors[color_idx] * strength
+            canvas[rr_aa, cc_aa] = np.clip(canvas[rr_aa, cc_aa], 0.0, 1.0)
 
-            # вычисляем основной цвет линии по фактическим RGB на пикселях линии
+            # основной цвет линии: берём реальные значения канвы на пикселях линии и квантем в {0,255}
             pull_colors = []
             for point in canvas[rr_aa, cc_aa][:]:
-                r, g, b = npToRGB(point)
+                r, g, b = npToRGB255(point)
                 color_string = f'{r},{g},{b}'
                 pull_colors.append(color_string)
+
             pull_main_color = Counter(pull_colors).most_common(5)
-            for c in range(len(pull_main_color)):
-                main_color = pull_main_color[c][0]
-                if '-' not in main_color:
+            main_color = '-1,-1,-1'
+            for cand, _cnt in pull_main_color:
+                if '-' not in cand:
+                    main_color = cand
                     break
 
             if isRect:
-                pull = f"{rectToABCD(pull_start)} -> {rectToABCD(pull_end)}"
+                pull = f"{rectToABCD(pull_start, nails)} -> {rectToABCD(pull_end, nails)}"
             else:
-                pull = f"{gradToABCD(pull_start)} -> {gradToABCD(pull_end)}"
-            if '-' in main_color:
-                main_color = '-1,-1,-1'
+                pull = f"{gradToABCD(pull_start, nails)} -> {gradToABCD(pull_end, nails)}"
+
             color_order.append([pull, main_color])
 
     print('Кол-во нитей:', len(color_order))
@@ -239,125 +260,175 @@ def pull_order_to_array_rgb(orders, canvas, nails, colors, strength, isRect):
     return [np.clip(canvas, a_min=0, a_max=1), color_order]
 
 
-def add_fields(file_path, isRect, nails):
-    blank = Image.open('images/blank.jpg')
-    picture = Image.open(file_path)
+# ====================== Надёжная разметка бланка ======================
 
-    blank = blank.convert('RGBA')
-    picture = picture.convert('RGBA')
-    field_size = picture.size[0] * 0.12
-    blank = blank.resize((int(picture.size[0] + field_size * 2), int(picture.size[1] + field_size * 2)),
-                         Image.Resampling.NEAREST)
-    height, width = picture.size
+class FieldAnnotator:
+    """
+    Поиск ресурсов относительным путём (images/blank.jpg, arial.ttf).
+    Если blank.jpg не найден — разметка пропускается, чтобы не ломать бота.
+    """
 
-    # circle crop
-    if not isRect:
-        picture = picture.convert('RGB')
-        lum_img = Image.new('L', [height, width], 0)
+    def __init__(self, base_file: str, images_subdir: str = "images"):
+        self.script_dir = os.path.dirname(os.path.abspath(base_file))
+        self.images_dir = os.path.join(self.script_dir, images_subdir)
 
-        draw = ImageDraw.Draw(lum_img)
-        draw.pieslice([(0, 0), (height, width)], 0, 360,
-                      fill=255, outline="white")
-        img_arr = np.array(picture)
-        lum_img_arr = np.array(lum_img)
-        final_img_arr = np.dstack((img_arr, lum_img_arr))
-        picture = Image.fromarray(final_img_arr)
-        picture = picture.rotate(-0.35)
+    def _res_path(self, *parts: str) -> str:
+        return os.path.join(self.script_dir, *parts)
 
-    position = (int(field_size), int(field_size))
-    blank.alpha_composite(picture, position)
+    def _img_path(self, *parts: str) -> str:
+        return os.path.join(self.images_dir, *parts)
 
-    # разметка бланка
-    res_height, res_width = blank.size
-    c = res_height // 1000 + 1  # correction
-    drawer = ImageDraw.Draw(blank)
-    offset = field_size // 3
+    def _load_font(self, size: int) -> ImageFont.FreeTypeFont:
+        candidates = [
+            self._res_path("arial.ttf"),
+            self._img_path("arial.ttf"),
+            "arial.ttf",
+        ]
+        for p in candidates:
+            try:
+                if os.path.exists(p):
+                    return ImageFont.truetype(p, size)
+            except Exception:
+                pass
+        try:
+            return ImageFont.truetype("arial.ttf", size)
+        except Exception:
+            return ImageFont.load_default()
 
-    scaled_nails = scale_nails(1.1, 1.1, nails)
-    ABCD_font_size = res_height // 24
-    p = width // 20
+    @staticmethod
+    def _scale_nails(x_ratio, y_ratio, nails):
+        return [(int(y_ratio * n[0]), int(x_ratio * n[1])) for n in nails]
 
-    font_size = res_height // 160  # 136
-    font = ImageFont.truetype("arial.ttf", font_size)
-    font_cor_w = font_size // 3.1
-    font_cor_h = font_size // 1.8
+    def add_fields(self, file_path: str, is_rect: bool, nails):
+        # ищем blank.jpg
+        candidates = [
+            self._img_path("blank.jpg"),
+            self._res_path("blank.jpg"),
+            os.path.join(os.getcwd(), "images", "blank.jpg"),
+            os.path.join(os.getcwd(), "blank.jpg"),
+        ]
+        blank_path = next((p for p in candidates if os.path.exists(p)), None)
+        if not blank_path:
+            print("WARN: BLANK_NOT_FOUND -> skip add_fields()", flush=True)
+            return
 
-    if isRect:
-        ABCD = {
-            'D': [(offset, res_width // 2), 'red'],
-            'C': [(res_height // 2, res_width - offset), 'orange'],
-            'B': [(res_height - offset, res_width // 2), 'blue'],
-            'A': [(res_height // 2, offset), 'green'],
-        }
-        nails_count = len(nails)
-        for i in range(nails_count):
-            xn, yn = nails[i][0] + field_size, nails[i][1] + field_size
-            drawer.ellipse((xn - c, yn - c, xn + c, yn + c), fill='red')  # гвозди
-            x, y = scaled_nails[i][0] + field_size - p, scaled_nails[i][1] + field_size - p
-            if i in range(1, nails_count // 4 + 1):
-                drawer.text((x - font_cor_w, y - font_cor_h), f"{nails_count // 4 - i + 1}", font=font,
-                            fill=ABCD['D'][1])
-                drawer.line((xn, yn, x, y), fill='gray', width=1)
-            if i in range(nails_count // 4 + 1, nails_count // 2):
-                if i % 2 == 0:
-                    drawer.text((x - font_cor_w, y - font_cor_h + 12), f"{nails_count // 2 - i + 1}", font=font,
-                                fill=ABCD['C'][1])
-                    drawer.line((xn, yn, x, y + 12), fill='gray', width=1)
-                else:
-                    drawer.text((x - font_cor_w, y - font_cor_h), f"{nails_count // 2 - i + 1}", font=font,
-                                fill=ABCD['C'][1])
-                    drawer.line((xn, yn, x, y), fill='gray', width=1)
-            if i == (nails_count // 4) * 3:
-                drawer.text((x - font_cor_w, y - font_cor_h), f"{1}", font=font, fill=ABCD['C'][1])
-                drawer.line((xn, yn, x, y), fill='gray', width=1)
-            if i in range(nails_count // 2, (nails_count // 4) * 3):
-                drawer.text((x - font_cor_w, y - font_cor_h), f"{i - 207}", font=font, fill=ABCD['B'][1])
-                drawer.line((xn, yn, x, y), fill='gray', width=1)
-            if i == 0:
-                drawer.text((x - font_cor_w, y - font_cor_h), f"{i + 1}", font=font, fill=ABCD['A'][1])
-                drawer.line((xn, yn, x, y), fill='gray', width=1)
-            if i in range((nails_count // 4) * 3 + 1, nails_count):
-                if i % 2 == 0:
-                    drawer.text((x - font_cor_w, y - font_cor_h), f"{abs((nails_count // 4) * 3 - 1 - i)}", font=font,
-                                fill=ABCD['A'][1])
-                    drawer.line((xn, yn, x, y), fill='gray', width=1)
-                else:
-                    drawer.text((x - font_cor_w, y - font_cor_h - 12), f"{abs((nails_count // 4) * 3 - 1 - i)}",
-                                font=font, fill=ABCD['A'][1])
-                    drawer.line((xn, yn, x, y - 12), fill='gray', width=1)
-    else:
-        ABCD = {
-            'A': [(offset, offset), 'green'],
-            'B': [(res_height - offset, offset), 'blue'],
-            'C': [(res_height - offset, res_width - offset), 'orange'],
-            'D': [(offset, res_width - offset), 'red'],
-        }
-        nails_count = len(nails)
-        for i in range(nails_count):
-            xn, yn = nails[i][0] + field_size, nails[i][1] + field_size
-            drawer.ellipse((xn - c, yn - c, xn + c, yn + c), fill='red')  # гвозди
-            x, y = scaled_nails[i][0] + field_size - p, scaled_nails[i][1] + field_size - p
-            if i in range(0, nails_count // 4):
-                drawer.text((x - font_cor_w, y - font_cor_h), f"{nails_count // 4 - i}", font=font, fill=ABCD['A'][1])
-                drawer.line((xn, yn, x, y), fill='gray', width=1)
-            if i in range(nails_count // 4, nails_count // 2):
-                drawer.text((x - font_cor_w, y - font_cor_h), f"{nails_count // 2 - i}", font=font, fill=ABCD['D'][1])
-                drawer.line((xn, yn, x, y), fill='gray', width=1)
-            if i in range(nails_count // 2, (nails_count // 4) * 3):
-                drawer.text((x - font_cor_w, y - font_cor_h), f"{abs(i - (nails_count // 4) * 3)}", font=font,
-                            fill=ABCD['C'][1])
-                drawer.line((xn, yn, x, y), fill='gray', width=1)
-            if i in range((nails_count // 4) * 3, nails_count):
-                drawer.text((x - font_cor_w, y - font_cor_h), f"{abs(i - nails_count)}", font=font, fill=ABCD['B'][1])
-                drawer.line((xn, yn, x, y), fill='gray', width=1)
+        try:
+            blank = Image.open(blank_path).convert("RGBA")
+        except Exception as e:
+            print(f"WARN: cannot open blank: {e} -> skip add_fields()", flush=True)
+            return
 
-    for letter in ABCD:
-        x, y = ABCD[letter][0][0] - ABCD_font_size // 3.1, ABCD[letter][0][1] - ABCD_font_size // 1.8
-        drawer.text((x, y), letter, font=ImageFont.truetype("arial.ttf", ABCD_font_size), fill=ABCD[letter][1])
+        try:
+            picture = Image.open(file_path).convert("RGBA")
+        except Exception as e:
+            print(f"WARN: cannot open picture: {e} -> skip add_fields()", flush=True)
+            return
 
-    blank = blank.convert('RGB')
-    blank.save(file_path)
+        field_size = picture.size[0] * 0.12
+        blank = blank.resize(
+            (int(picture.size[0] + field_size * 2), int(picture.size[1] + field_size * 2)),
+            Image.Resampling.NEAREST,
+        )
+        height, width = picture.size
 
+        # круглый кроп для круглого поля
+        if not is_rect:
+            pic_rgb = picture.convert("RGB")
+            lum = Image.new("L", [height, width], 0)
+            draw = ImageDraw.Draw(lum)
+            draw.pieslice([(0, 0), (height, width)], 0, 360, fill=255, outline="white")
+            final = np.dstack((np.array(pic_rgb), np.array(lum)))
+            picture = Image.fromarray(final).rotate(-0.35)
+
+        position = (int(field_size), int(field_size))
+        blank.alpha_composite(picture, position)
+
+        # разметка
+        res_h, res_w = blank.size
+        c = res_h // 1000 + 1
+        drawer = ImageDraw.Draw(blank)
+        offset = field_size // 3
+
+        scaled_for_labels = self._scale_nails(1.1, 1.1, nails)
+        ABCD_font_size = res_h // 24
+        p = width // 20
+
+        font_size = res_h // 160
+        font = self._load_font(font_size)
+        fw, fh = int(font_size // 3.1), int(font_size // 1.8)
+
+        if is_rect:
+            ABCD = {
+                "D": [(offset, res_w // 2), "red"],
+                "C": [(res_h // 2, res_w - offset), "orange"],
+                "B": [(res_h - offset, res_w // 2), "blue"],
+                "A": [(res_h // 2, offset), "green"],
+            }
+            n = len(nails)
+            for i in range(n):
+                xn, yn = nails[i][0] + field_size, nails[i][1] + field_size
+                drawer.ellipse((xn - c, yn - c, xn + c, yn + c), fill="red")
+                x, y = scaled_for_labels[i][0] + field_size - p, scaled_for_labels[i][1] + field_size - p
+                if i in range(1, n // 4 + 1):
+                    drawer.text((x - fw, y - fh), f"{n // 4 - i + 1}", font=font, fill=ABCD["D"][1])
+                    drawer.line((xn, yn, x, y), fill="gray", width=1)
+                if i in range(n // 4 + 1, n // 2):
+                    if i % 2 == 0:
+                        drawer.text((x - fw, y - fh + 12), f"{n // 2 - i + 1}", font=font, fill=ABCD["C"][1])
+                        drawer.line((xn, yn, x, y + 12), fill="gray", width=1)
+                    else:
+                        drawer.text((x - fw, y - fh), f"{n // 2 - i + 1}", font=font, fill=ABCD["C"][1])
+                        drawer.line((xn, yn, x, y), fill="gray", width=1)
+                if i == (n // 4) * 3:
+                    drawer.text((x - fw, y - fh), "1", font=font, fill=ABCD["C"][1])
+                    drawer.line((xn, yn, x, y), fill="gray", width=1)
+                if i in range(n // 2, (n // 4) * 3):
+                    drawer.text((x - fw, y - fh), f"{i - 207}", font=font, fill=ABCD["B"][1])
+                    drawer.line((xn, yn, x, y), fill="gray", width=1)
+                if i == 0:
+                    drawer.text((x - fw, y - fh), f"{i + 1}", font=font, fill=ABCD["A"][1])
+                    drawer.line((xn, yn, x, y), fill="gray", width=1)
+                if i in range((n // 4) * 3 + 1, n):
+                    if i % 2 == 0:
+                        drawer.text((x - fw, y - fh), f"{abs((n // 4) * 3 - 1 - i)}", font=font, fill=ABCD["A"][1])
+                        drawer.line((xn, yn, x, y), fill="gray", width=1)
+                    else:
+                        drawer.text((x - fw, y - fh - 12), f"{abs((n // 4) * 3 - 1 - i)}", font=font, fill=ABCD["A"][1])
+                        drawer.line((xn, yn, x, y - 12), fill="gray", width=1)
+        else:
+            ABCD = {
+                "A": [(offset, offset), "green"],
+                "B": [(res_h - offset, offset), "blue"],
+                "C": [(res_h - offset, res_w - offset), "orange"],
+                "D": [(offset, res_w - offset), "red"],
+            }
+            n = len(nails)
+            for i in range(n):
+                xn, yn = nails[i][0] + field_size, nails[i][1] + field_size
+                drawer.ellipse((xn - c, yn - c, xn + c, yn + c), fill="red")
+                x, y = scaled_for_labels[i][0] + field_size - p, scaled_for_labels[i][1] + field_size - p
+                if i in range(0, n // 4):
+                    drawer.text((x - fw, y - fh), f"{n // 4 - i}", font=font, fill=ABCD["A"][1])
+                    drawer.line((xn, yn, x, y), fill="gray", width=1)
+                if i in range(n // 4, n // 2):
+                    drawer.text((x - fw, y - fh), f"{n // 2 - i}", font=font, fill=ABCD["D"][1])
+                    drawer.line((xn, yn, x, y), fill="gray", width=1)
+                if i in range(n // 2, (n // 4) * 3):
+                    drawer.text((x - fw, y - fh), f"{abs(i - (n // 4) * 3)}", font=font, fill=ABCD["C"][1])
+                    drawer.line((xn, yn, x, y), fill="gray", width=1)
+                if i in range((n // 4) * 3, n):
+                    drawer.text((x - fw, y - fh), f"{abs(i - n)}", font=font, fill=ABCD["B"][1])
+                    drawer.line((xn, yn, x, y), fill="gray", width=1)
+
+        for letter in ABCD:
+            big = self._load_font(ABCD_font_size)
+            x, y = ABCD[letter][0][0] - ABCD_font_size // 3.1, ABCD[letter][0][1] - ABCD_font_size // 1.8
+            drawer.text((x, y), letter, font=big, fill=ABCD[letter][1])
+
+        blank.convert("RGB").save(file_path)
+
+
+# =============================== MAIN ===============================
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Create String Art')
@@ -377,10 +448,9 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
 
-    # img = convert(args.input_file)
     img = mpimg.imread(args.input_file)
     if np.any(img > 100):
-        img = img / 255
+        img = img / 255.0
 
     if args.rect:
         LONG_SIDE = 313
@@ -397,10 +467,12 @@ if __name__ == '__main__':
         shape = (len(img), len(img[0]))
         nails = create_circle_nail_positions(shape, args.nail_step, args.radius1_multiplier, args.radius2_multiplier)
 
-    print(f"Nails amount: {len(nails)}")
+    print(f"Nails amount: {len(nails)}", flush=True)
+
+    annot = FieldAnnotator(base_file=__file__, images_subdir="images")
 
     if args.rgb:
-        # ВАЖНО: wb=True => белая канва => линии должны ЗАТЕМНЯТЬ изображение
+        # Белый фон -> линии затемняют -> отрицательная сила
         iteration_strength = -0.1 if args.wb else 0.1
 
         r = img[:, :, 0]
@@ -409,25 +481,34 @@ if __name__ == '__main__':
 
         total_for_progress = (args.pull_amount or 0) * 3 if args.pull_amount else None
 
-        # канвы под каналы: белая при wb=True
         str_pic_r = init_canvas(shape, black=not args.wb)
-        pull_orders_r = create_art(nails, r, str_pic_r, iteration_strength,
-                                   i_limit=args.pull_amount,
-                                   progress_offset=0,
-                                   progress_total=total_for_progress)
+        pull_orders_r = create_art(
+            nails, r, str_pic_r, iteration_strength,
+            i_limit=args.pull_amount,
+            progress_offset=0,
+            progress_total=total_for_progress,
+            random_nails=args.random_nails
+        )
 
         str_pic_g = init_canvas(shape, black=not args.wb)
-        pull_orders_g = create_art(nails, g, str_pic_g, iteration_strength,
-                                   i_limit=args.pull_amount,
-                                   progress_offset=(args.pull_amount or 0),
-                                   progress_total=total_for_progress)
+        pull_orders_g = create_art(
+            nails, g, str_pic_g, iteration_strength,
+            i_limit=args.pull_amount,
+            progress_offset=(args.pull_amount or 0),
+            progress_total=total_for_progress,
+            random_nails=args.random_nails
+        )
 
         str_pic_b = init_canvas(shape, black=not args.wb)
-        pull_orders_b = create_art(nails, b, str_pic_b, iteration_strength,
-                                   i_limit=args.pull_amount,
-                                   progress_offset=(args.pull_amount or 0) * 2,
-                                   progress_total=total_for_progress)
+        pull_orders_b = create_art(
+            nails, b, str_pic_b, iteration_strength,
+            i_limit=args.pull_amount,
+            progress_offset=(args.pull_amount or 0) * 2,
+            progress_total=total_for_progress,
+            random_nails=args.random_nails
+        )
 
+        # выравниваем длины (как в стоке)
         max_pulls = np.max([len(pull_orders_r), len(pull_orders_g), len(pull_orders_b)])
         pull_orders_r = pull_orders_r + [pull_orders_r[-1]] * (max_pulls - len(pull_orders_r))
         pull_orders_g = pull_orders_g + [pull_orders_g[-1]] * (max_pulls - len(pull_orders_g))
@@ -435,9 +516,8 @@ if __name__ == '__main__':
 
         pull_orders = [pull_orders_r, pull_orders_g, pull_orders_b]
 
-        color_image_dimens = int(args.side_len * args.radius1_multiplier), int(
-            args.side_len * args.radius2_multiplier), 3
-        blank = init_canvas(color_image_dimens, black=not args.wb)  # белая/чёрная конечная канва
+        color_image_dimens = int(args.side_len * args.radius1_multiplier), int(args.side_len * args.radius2_multiplier), 3
+        blank = init_canvas(color_image_dimens, black=not args.wb)
 
         scaled_nails = scale_nails(
             color_image_dimens[1] / shape[1],
@@ -450,44 +530,60 @@ if __name__ == '__main__':
             blank,
             scaled_nails,
             (np.array((1., 0., 0.,)), np.array((0., 1., 0.,)), np.array((0., 0., 1.,))),
-            -args.export_strength if args.wb else args.export_strength,  # ВАЖНО: wb True -> отрицательная сила
+            -args.export_strength if args.wb else args.export_strength,
             args.rect
         )
 
-        colors = {
-            '255,0,255': 'Фиолетовый',
-            '0,255,255': 'Голубой',
-            '255,255,0': 'Желтый',
-            '0,0,255': 'Синий',
-            '0,0,0': 'Черный',
+        # только допустимые комбинации {0,255}^3
+        colors_map = {
             '255,0,0': 'Красный',
             '0,255,0': 'Зеленый',
-            '-1,-1,-1': 'Нет цвета'
+            '0,0,255': 'Синий',
+            '255,255,0': 'Желтый',
+            '0,255,255': 'Голубой',
+            '255,0,255': 'Фиолетовый',
+            '0,0,0': 'Черный',
+            '255,255,255': 'Белый',
+            '-1,-1,-1': 'Нет цвета',
         }
 
-        df = pd.DataFrame([[pair[0], colors[pair[1]], pair[1]] for pair in instruction],
-                          columns=['Нить', 'Цвет', 'RGB'])
+        # сохраняем PNG
+        plt.imsave(args.output_file, np.clip(result, 0.0, 1.0))
+
+        # сохраняем XLSX: Нить / Цвет / RGB
+        df = pd.DataFrame(
+            [[pair[0], colors_map.get(pair[1], pair[1]), pair[1]] for pair in instruction],
+            columns=['Нить', 'Цвет', 'RGB']
+        )
         df.to_excel(f"{args.output_file}_instruction.xlsx", index=False)
-        mpimg.imsave(args.output_file, result, cmap=plt.get_cmap("gray"), vmin=0.0, vmax=1.0)
-        add_fields(args.output_file, args.rect, scaled_nails)
+
+        # разметка бланка (не критична — если нет blank.jpg, просто пропустим)
+        annot.add_fields(file_path=args.output_file, is_rect=args.rect, nails=scaled_nails)
+
         print("100%", flush=True)
 
     else:
+        # Grayscale
         orig_pic = rgb2gray(img) * 0.9
 
         image_dimens = int(args.side_len * args.radius1_multiplier), int(args.side_len * args.radius2_multiplier)
 
-        # канва для моно: белая при wb=True
         if args.wb:
+            # белая канва, линии затемняют
             str_pic = init_canvas(shape, black=False)
-            pull_order = create_art(nails, orig_pic, str_pic, -0.05, i_limit=args.pull_amount,
-                                    progress_offset=0, progress_total=args.pull_amount)
+            pull_order = create_art(
+                nails, orig_pic, str_pic, -0.05, i_limit=args.pull_amount,
+                progress_offset=0, progress_total=args.pull_amount, random_nails=args.random_nails
+            )
             blank = init_canvas(image_dimens, black=False)
             strength = -args.export_strength
         else:
+            # чёрная канва, линии светлеют
             str_pic = init_canvas(shape, black=True)
-            pull_order = create_art(nails, orig_pic, str_pic, 0.05, i_limit=args.pull_amount,
-                                    progress_offset=0, progress_total=args.pull_amount)
+            pull_order = create_art(
+                nails, orig_pic, str_pic, 0.05, i_limit=args.pull_amount,
+                progress_offset=0, progress_total=args.pull_amount, random_nails=args.random_nails
+            )
             blank = init_canvas(image_dimens, black=True)
             strength = args.export_strength
 
@@ -499,4 +595,8 @@ if __name__ == '__main__':
 
         result = pull_order_to_array_bw(pull_order, blank, scaled_nails, strength)
         mpimg.imsave(args.output_file, result, cmap=plt.get_cmap("gray"), vmin=0.0, vmax=1.0)
+
+        # разметка бланка
+        annot.add_fields(file_path=args.output_file, is_rect=args.rect, nails=scaled_nails)
+
         print("100%", flush=True)

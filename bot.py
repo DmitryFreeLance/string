@@ -1,9 +1,12 @@
 import asyncio
 import logging
 import os
+import sys
 import uuid
 import tempfile
+from html import escape as html_escape
 from datetime import datetime
+
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
 from aiogram.types import (
@@ -178,9 +181,9 @@ async def handle_photo(message: Message):
         output_png = os.path.join(OUTPUT_DIR, f"{uuid.uuid4()}.png")
         output_xlsx = f"{output_png}_instruction.xlsx"
 
-        # Цветной + белый фон, «сочные» параметры (как у тебя):
+        # Запускаем тем же интерпретатором, что и бот:
         cmd = [
-            "python", STRINGART_SCRIPT,
+            sys.executable, STRINGART_SCRIPT,
             "-i", input_path,
             "-o", output_png,
             "-d", "3000",                # dimension
@@ -235,8 +238,9 @@ async def handle_photo(message: Message):
                     doc = FSInputFile(output_png)
                     await message.answer_document(doc, caption=cfg["label"], reply_markup=kb_instruction(uid, idx))
                 except Exception as e:
+                    safe_err = html_escape(str(e))[:4000]
                     await message.answer(
-                        f"❌ Ошибка при отправке результата «{cfg['label']}»:\n<code>{e}</code>",
+                        f"❌ Ошибка при отправке результата «{cfg['label']}»:\n<code>{safe_err}</code>",
                         parse_mode="HTML"
                     )
 
@@ -261,10 +265,16 @@ async def handle_photo(message: Message):
                 await progress_msg.edit_text(f"❌ {cfg['label']}: ошибка генерации")
             except Exception:
                 pass
+
+            # ЭКРАНИРУЕМ stderr, иначе Telegram сочтёт <module> тегом
+            safe_stderr = html_escape(stderr).strip()
+            if not safe_stderr:
+                safe_stderr = "unknown error"
             await message.answer(
-                f"❌ Ошибка при генерации «{cfg['label']}»:\n<code>{stderr}</code>",
+                f"❌ Ошибка при генерации «{cfg['label']}»:\n<code>{safe_stderr[:3500]}</code>",
                 parse_mode="HTML"
             )
+
             if os.path.exists(output_png):
                 try:
                     os.remove(output_png)
@@ -318,6 +328,7 @@ async def handle_choice(callback: CallbackQuery):
         except:
             pass
     else:
+        # без HTML, чтобы случайные угловые скобки не сломали отправку
         await callback.message.answer("❌ Инструкция не найдена. Возможно, генерация прервалась.")
 
     if os.path.exists(png_path):
