@@ -16,7 +16,7 @@ from aiogram.types import (
 from PIL import Image
 
 # ================== НАСТРОЙКИ ==================
-BOT_TOKEN = "7791601838:AAGKBsubpH1TzLYafINnCwz315Lf1qvkjxU"  # <-- поставь свой токен
+BOT_TOKEN = "7791601838:AAGKBsubpH1TzLYafINnCwz315Lf1qvkjxU"   # <-- поставь свой токен
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STRINGART_SCRIPT = os.path.join(BASE_DIR, "stringart", "generate.py")
 OUTPUT_DIR = os.path.join(BASE_DIR, "output")
@@ -83,7 +83,7 @@ def dec_use(uid: int):
 def _find_instruction_near_png(png_path: str) -> Optional[str]:
     """
     Ищет файл инструкции рядом с png:
-      - <png>.png_instruction.xlsx  (твой кейс)
+      - <png>.png_instruction.xlsx
       - <png>_instruction.xlsx
       - *instruction*.xlsx
     """
@@ -91,12 +91,10 @@ def _find_instruction_near_png(png_path: str) -> Optional[str]:
     base_with_ext = os.path.basename(png_path)        # abc.png
     base_no_ext, _ = os.path.splitext(base_with_ext)  # abc
 
-    # самые вероятные имена
     candidates = [
         os.path.join(folder, base_with_ext + "_instruction.xlsx"),  # abc.png_instruction.xlsx
         os.path.join(folder, base_no_ext + "_instruction.xlsx"),    # abc_instruction.xlsx
     ]
-    # любые instruction рядом
     patterns = [
         os.path.join(folder, f"{base_no_ext}*instruction*.xlsx"),
         os.path.join(folder, f"{base_with_ext}*instruction*.xlsx"),
@@ -117,10 +115,7 @@ def _find_instruction_near_png(png_path: str) -> Optional[str]:
 
 
 def _find_recent_xlsx(output_dir: str, ref_time: float, window_sec: int = 600) -> Optional[str]:
-    """
-    Находит .xlsx в папке output, созданный/изменённый максимально близко к ref_time.
-    Если ничего не в окне — вернёт самый свежий .xlsx.
-    """
+    """Находит .xlsx в папке output, созданный/изменённый максимально близко к ref_time."""
     xlsx_files = glob(os.path.join(output_dir, "*.xlsx"))
     if not xlsx_files:
         return None
@@ -207,6 +202,9 @@ async def cmd_status(message: Message):
 async def handle_photo(message: Message):
     uid = message.from_user.id
 
+    # гарантируем наличие словаря для пользователя (устраняем гонки/KeyError)
+    user_results.setdefault(uid, {})
+
     code = user_codes.get(uid)
     if code:
         st = get_code_status(code)
@@ -220,12 +218,11 @@ async def handle_photo(message: Message):
     await bot.download(photo, destination=input_path)
 
     configs = [
-        {"pull_amount": "500", "label": "Вариант 1 — ≈340 гвоздей, 4500 нитей"},
-        {"pull_amount": "500", "label": "Вариант 2 — ≈340 гвоздей, 5000 нитей"},
-        {"pull_amount": "500", "label": "Вариант 3 — ≈340 гвоздей, 5500 нитей"},
+        {"pull_amount": "4500", "label": "Вариант 1 — ≈340 гвоздей, 4500 нитей"},
+        {"pull_amount": "5000", "label": "Вариант 2 — ≈340 гвоздей, 5000 нитей"},
+        {"pull_amount": "5500", "label": "Вариант 3 — ≈340 гвоздей, 5500 нитей"},
     ]
 
-    results = {}
     all_ok = True
 
     for idx, cfg in enumerate(configs, start=1):
@@ -274,7 +271,28 @@ async def handle_photo(message: Message):
             except Exception:
                 pass
 
-            # превью
+            # фиксируем mtime сразу
+            try:
+                png_mtime = os.path.getmtime(output_png)
+            except Exception:
+                png_mtime = datetime.now().timestamp()
+
+            # находим/запоминаем Excel
+            xlsx_path: Optional[str] = expected_xlsx if os.path.exists(expected_xlsx) else None
+            if not xlsx_path:
+                xlsx_path = _find_instruction_near_png(output_png)
+            if not xlsx_path:
+                xlsx_path = _find_recent_xlsx(OUTPUT_DIR, ref_time=png_mtime, window_sec=600)
+
+            # ещё раз гарантируем, что словарь существует (если бот перезапустили между вариантами)
+            user_results.setdefault(uid, {})
+            user_results[uid][str(idx)] = {
+                "png": output_png,
+                "xlsx": xlsx_path,
+                "png_mtime": png_mtime
+            }
+
+            # отправляем превью + кнопку
             preview_path = None
             try:
                 preview_path = make_preview_jpeg(output_png)
@@ -287,28 +305,6 @@ async def handle_photo(message: Message):
                 except Exception as e:
                     await message.answer(f"❌ Ошибка при отправке результата «{cfg['label']}»:\n{e}")
 
-            # --- поиск инструкции ---
-            xlsx_path: Optional[str] = None
-
-            if os.path.exists(expected_xlsx):
-                xlsx_path = expected_xlsx
-
-            if not xlsx_path:
-                xlsx_path = _find_instruction_near_png(output_png)
-
-            if not xlsx_path:
-                try:
-                    png_mtime = os.path.getmtime(output_png)
-                except Exception:
-                    png_mtime = datetime.now().timestamp()
-                xlsx_path = _find_recent_xlsx(OUTPUT_DIR, ref_time=png_mtime, window_sec=600)
-
-            results[str(idx)] = {
-                "png": output_png,
-                "xlsx": xlsx_path,
-                "png_mtime": os.path.getmtime(output_png)
-            }
-
             if preview_path and os.path.exists(preview_path):
                 try:
                     os.remove(preview_path)
@@ -317,7 +313,7 @@ async def handle_photo(message: Message):
 
             if not xlsx_path:
                 await message.answer(
-                    "⚠️ Инструкция Excel пока не найдена. Нажмите «📊 Получить инструкцию» — я проверю ещё раз."
+                    f"⚠️ Инструкция для «{cfg['label']}» пока не найдена. Нажмите «📊 Получить инструкцию» — я проверю ещё раз."
                 )
         else:
             all_ok = False
@@ -332,18 +328,18 @@ async def handle_photo(message: Message):
                 except:
                     pass
 
-    user_results[uid] = results
+    # списываем использование один раз за сессию из трёх вариантов
     dec_use(uid)
 
     if all_ok:
         await message.answer(
-            "🎉 Все три варианта готовы! Выберите понравившийся и нажмите «📊 Получить инструкцию».\n\n"
+            "🎉 Варианты поступают по мере готовности. Для каждого уже можно запрашивать Excel.\n\n"
             "Хотите попробовать другое фото? Нажмите «Загрузить ещё фото» ниже ⬇️",
             reply_markup=kb_more_status(uid)
         )
     else:
         await message.answer(
-            "Готово с предупреждениями. Можно отправить другое фото или запросить инструкцию для удачных вариантов.",
+            "Готово с предупреждениями. Для успешно сгенерированных вариантов можно запросить Excel, либо отправить другое фото.",
             reply_markup=kb_more_status(uid)
         )
 
@@ -361,7 +357,10 @@ async def handle_choice(callback: CallbackQuery):
     _, uid, idx = callback.data.split("_")
     uid = int(uid)
 
-    if uid not in user_results or idx not in user_results[uid]:
+    # гарантируем структуру, даже если бот перезапускался
+    user_results.setdefault(uid, {})
+
+    if idx not in user_results[uid]:
         await callback.answer("Результат не найден", show_alert=True)
         return
 
@@ -370,15 +369,13 @@ async def handle_choice(callback: CallbackQuery):
     png_path = files.get("png")
     png_mtime = files.get("png_mtime") or (os.path.getmtime(png_path) if png_path and os.path.exists(png_path) else None)
 
-    # повторный поиск, если путь пустой/устарел
+    # повторный поиск на случай, если файл появился только что
     if (not xlsx_path) or (xlsx_path and not os.path.exists(xlsx_path)):
-        # 1) рядом с PNG
         if png_path and os.path.exists(png_path):
             xlsx_path = _find_instruction_near_png(png_path)
-        # 2) по времени в OUTPUT_DIR
         if (not xlsx_path) and png_mtime:
             xlsx_path = _find_recent_xlsx(OUTPUT_DIR, ref_time=png_mtime, window_sec=600)
-        files["xlsx"] = xlsx_path  # обновим кеш
+        files["xlsx"] = xlsx_path
 
     if xlsx_path and os.path.exists(xlsx_path):
         try:
@@ -386,17 +383,16 @@ async def handle_choice(callback: CallbackQuery):
             await callback.message.answer_document(doc, caption="📊 Ваша инструкция (Excel)")
         except Exception as e:
             await callback.message.answer(f"❌ Не удалось отправить файл:\n{e}")
-        # можно удалить файл после отправки
+        # опционально чистим xlsx
         try:
             os.remove(xlsx_path)
         except:
             pass
     else:
-        # отладочная подсказка
         folder = os.path.dirname(png_path) if png_path else OUTPUT_DIR
         nearby = "\n".join(os.path.basename(p) for p in glob(os.path.join(folder, "*instruction*.xlsx")))
         await callback.message.answer(
-            "❌ Инструкция не найдена.\n\n"
+            "❌ Инструкция пока не найдена.\n\n"
             f"Искал рядом с PNG и в {OUTPUT_DIR}.\n"
             f"PNG: {png_path}\n"
             f"Папка: {folder}\n"
